@@ -588,3 +588,30 @@ def get_airline_routes(airline_id: int):
         """), {"airline_id": airline_id}).fetchall()
         routes = [dict(row._mapping) for row in result]
         return {"routes": routes}
+
+    
+@app.get("/airlines/{airline_id}/fleet")
+def get_airline_fleet(airline_id: int):
+    engine = create_engine(os.getenv("DATABASE_URL"))
+    with engine.connect() as connection:
+        result = connection.execute(sql_text("""
+            SELECT f.id, at.name, at.seat_capacity, f.ownership_type,
+                   f.monthly_payment, f.remaining_balance, f.status
+            FROM fleet f
+            JOIN aircraft_types at ON f.aircraft_type_id = at.id
+            WHERE f.airline_id = :airline_id
+        """), {"airline_id": airline_id}).fetchall()
+        fleet = [dict(row._mapping) for row in result]
+        return {"fleet": fleet}
+
+@app.get("/aircraft-types")
+def get_aircraft_types():
+    engine = create_engine(os.getenv("DATABASE_URL"))
+    with engine.connect() as connection:
+        result = connection.execute(sql_text("""
+            SELECT id, name, manufacturer, seat_capacity, max_range_km,
+                   purchase_price, lease_price_monthly
+            FROM aircraft_types ORDER BY purchase_price ASC
+        """)).fetchall()
+        aircraft = [dict(row._mapping) for row in result]
+        return {"aircraft_types": aircraft}
