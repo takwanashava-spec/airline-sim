@@ -10,6 +10,15 @@ load_dotenv()
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.get("/")
 def read_root():
     return {"message": "Airline Sim backend is alive"}
@@ -550,3 +559,32 @@ def run_ai_decisions(connection):
                                 UPDATE fleet SET status = 'assigned' WHERE id = :id
                             """), {"id": fleet_to_use.id})
                             break
+
+@app.get("/airlines/{airline_id}")
+def get_airline(airline_id: int):
+    engine = create_engine(os.getenv("DATABASE_URL"))
+    with engine.connect() as connection:
+        result = connection.execute(
+            sql_text("SELECT id, name, cash_balance FROM airlines WHERE id = :id"),
+            {"id": airline_id}
+        ).fetchone()
+        if not result:
+            return {"error": "Airline not found"}
+        return {"airline": dict(result._mapping)}
+
+@app.get("/airlines/{airline_id}/routes")
+def get_airline_routes(airline_id: int):
+    engine = create_engine(os.getenv("DATABASE_URL"))
+    with engine.connect() as connection:
+        result = connection.execute(sql_text("""
+            SELECT r.id, o.iata_code AS origin, d.iata_code AS destination,
+                   at.name AS aircraft, r.price_economy, r.last_load_factor
+            FROM routes r
+            JOIN airports o ON r.origin_airport_id = o.id
+            JOIN airports d ON r.destination_airport_id = d.id
+            JOIN fleet f ON r.fleet_id = f.id
+            JOIN aircraft_types at ON f.aircraft_type_id = at.id
+            WHERE r.airline_id = :airline_id
+        """), {"airline_id": airline_id}).fetchall()
+        routes = [dict(row._mapping) for row in result]
+        return {"routes": routes}
