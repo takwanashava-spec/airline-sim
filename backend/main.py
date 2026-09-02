@@ -325,6 +325,8 @@ def run_tick():
             market_demand = BASE_DAILY_MARKET_DEMAND * distance_factor * price_factor * random_factor
             seats_available_today = r.seat_capacity * flights_today
             seats_filled = min(market_demand, seats_available_today)
+            actual_load_factor = seats_filled / max(seats_available_today, 1)
+            connection.execute(sql_text("UPDATE routes SET last_load_factor = :lf WHERE id = :id"), {"lf": actual_load_factor, "id": r.id})
 
             economy_seats = round(seats_filled * 0.80)
             business_seats = round(seats_filled * 0.15)
@@ -397,6 +399,7 @@ def run_tick():
         connection.execute(sql_text("""
             UPDATE game_state SET current_game_date = :date, game_day_count = :count
         """), {"date": new_date, "count": new_day_count})
+        run_ai_decisions(connection)
 
         connection.commit()
 
@@ -434,3 +437,116 @@ def update_route_price(route_id: int, req: UpdateRoutePriceRequest):
         connection.commit()
 
         return {"route_id": route_id, "price_economy": req.price_economy, "price_business": req.price_business, "price_first": req.price_first, "status": "updated"}
+
+PERSONALITY_SETTINGS = {
+    "aggressive": {"expansion_chance": 0.35, "price_adjust_speed": 0.08, "target_load_factor": 0.75},
+    "cautious":   {"expansion_chance": 0.08, "price_adjust_speed": 0.03, "target_load_factor": 0.65},
+    "premium":    {"expansion_chance": 0.12, "price_adjust_speed": 0.05, "target_load_factor": 0.60},
+    "budget":     {"expansion_chance": 0.30, "price_adjust_speed": 0.06, "target_load_factor": 0.85},
+    "balanced":   {"expansion_chance": 0.18, "price_adjust_speed": 0.05, "target_load_factor": 0.70},
+}
+
+def run_ai_decisions(connection):
+    ai_airlines = connection.execute(sql_text("""
+        SELECT id, name, hub_airport_id, cash_balance, ai_personality
+        FROM airlines WHERE is_ai = true
+    """)).fetchall()
+
+    all_airports = connection.execute(sql_text("""
+        SELECT id, iata_code, latitude, longitude FROM airports
+    """)).fetchall()
+
+    for airline in ai_airlines:
+        settings = PERSONALITY_SETTINGS.get(airline.ai_personality, PERSONALITY_SETTINGS["balanced"])
+
+        routes = connection.execute(sql_text("""
+            SELECT id, price_economy, price_business, price_first, last_load_factor
+            FROM routes WHERE airline_id = :airline_id
+        """), {"airline_id": airline.id}).fetchall()
+
+        for route in routes:
+            lf = float(route.last_load_factor or 0)
+            target = settings["target_load_factor"]
+            speed = settings["price_adjust_speed"]
+
+            if lf > target + 0.1:
+                adjustment = 1 + speed
+            elif lf < target - 0.1:
+                adjustment = 1 - speed
+            else:
+                adjustment = 1.0
+
+            if adjustment != 1.0:
+                new_economy = max(30, float(route.price_economy) * adjustment)
+                new_business = max(60, float(route.price_business) * adjustment)
+                new_first = max(100, float(route.price_first) * adjustment)
+                connection.execute(sql_text("""
+                    UPDATE routes SET price_economy = :pe, price_business = :pb, price_first = :pf
+                    WHERE id = :id
+                """), {"pe": new_economy, "pb": new_business, "pf": new_first, "id": route.id})
+
+        if random.random() < settings["expansion_chance"]:
+            idle_fleet = connection.execute(sql_text("""
+                SELECT f.id, at.max_range_km, at.seat_capacity, at.name
+                FROM fleet f JOIN aircraft_types at ON f.aircraft_type_id = at.id
+                WHERE f.airline_id = :airline_id AND f.status = 'idle'
+                LIMIT 1
+            """), {"airline_id": airline.id}).fetchone()
+
+            fleet_to_use = idle_fleet
+
+            if not fleet_to_use:
+                affordable_aircraft = connection.execute(sql_text("""
+                    SELECT id, name, purchase_price, lease_price_monthly, max_range_km, seat_capacity
+                    FROM aircraft_types
+                    WHERE lease_price_monthly < :cash_check
+                    ORDER BY purchase_price ASC
+                """), {"cash_check": float(airline.cash_balance) * 0.5}).fetchall()
+
+                if affordable_aircraft:
+                    chosen = random.choice(affordable_aircraft[:5]) if len(affordable_aircraft) >= 5 else affordable_aircraft[0]
+                    result = connection.execute(sql_text("""
+                        INSERT INTO fleet (airline_id, aircraft_type_id, ownership_type, monthly_payment, status)
+                        VALUES (:airline_id, :aircraft_type_id, 'leased', :monthly_payment, 'idle')
+                        RETURNING id
+                    """), {
+                        "airline_id": airline.id,
+                        "aircraft_type_id": chosen.id,
+                        "monthly_payment": float(chosen.lease_price_monthly)
+                    })
+                    new_fleet_id = result.fetchone()[0]
+                    fleet_to_use = type('obj', (object,), {
+                        'id': new_fleet_id, 'max_range_km': chosen.max_range_km,
+                        'seat_capacity': chosen.seat_capacity, 'name': chosen.name
+                    })
+
+            if fleet_to_use:
+                candidates = [a for a in all_airports if a.id != airline.hub_airport_id]
+                random.shuffle(candidates)
+
+                hub = next((a for a in all_airports if a.id == airline.hub_airport_id), None)
+
+                for dest in candidates[:10]:
+                    if not hub:
+                        break
+                    distance = haversine_km(hub.latitude, hub.longitude, dest.latitude, dest.longitude)
+                    if distance <= fleet_to_use.max_range_km and distance > 200:
+                        existing = connection.execute(sql_text("""
+                            SELECT id FROM routes
+                            WHERE airline_id = :airline_id AND origin_airport_id = :origin AND destination_airport_id = :dest
+                        """), {"airline_id": airline.id, "origin": hub.id, "dest": dest.id}).fetchone()
+
+                        if not existing:
+                            ref_price = calculate_reference_price(distance)
+                            connection.execute(sql_text("""
+                                INSERT INTO routes (airline_id, origin_airport_id, destination_airport_id, fleet_id, price_economy, price_business, price_first, frequency_per_week)
+                                VALUES (:airline_id, :origin, :dest, :fleet_id, :pe, :pb, :pf, 7)
+                            """), {
+                                "airline_id": airline.id, "origin": hub.id, "dest": dest.id,
+                                "fleet_id": fleet_to_use.id,
+                                "pe": ref_price, "pb": ref_price * 2.5, "pf": ref_price * 5
+                            })
+                            connection.execute(sql_text("""
+                                UPDATE fleet SET status = 'assigned' WHERE id = :id
+                            """), {"id": fleet_to_use.id})
+                            break
