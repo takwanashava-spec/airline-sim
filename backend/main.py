@@ -565,7 +565,11 @@ def get_airline(airline_id: int):
     engine = create_engine(os.getenv("DATABASE_URL"))
     with engine.connect() as connection:
         result = connection.execute(
-            sql_text("SELECT id, name, cash_balance FROM airlines WHERE id = :id"),
+            sql_text("""
+                SELECT a.id, a.name, a.cash_balance, ap.iata_code AS hub_iata
+                FROM airlines a JOIN airports ap ON a.hub_airport_id = ap.id
+                WHERE a.id = :id
+            """),
             {"id": airline_id}
         ).fetchone()
         if not result:
@@ -615,3 +619,75 @@ def get_aircraft_types():
         """)).fetchall()
         aircraft = [dict(row._mapping) for row in result]
         return {"aircraft_types": aircraft}
+
+@app.get("/airports/search")
+def search_airports(q: str):
+    engine = create_engine(os.getenv("DATABASE_URL"))
+    with engine.connect() as connection:
+        result = connection.execute(sql_text("""
+            SELECT id, iata_code, name, city, country
+            FROM airports
+            WHERE iata_code ILIKE :q OR city ILIKE :q OR name ILIKE :q
+            ORDER BY iata_code
+            LIMIT 10
+        """), {"q": f"%{q}%"}).fetchall()
+        airports = [dict(row._mapping) for row in result]
+        return {"airports": airports}
+class OpenRouteFromUIRequest(BaseModel):
+    airline_id: int
+    fleet_id: int
+    destination_airport_id: int
+    price_economy: float
+    price_business: float
+    price_first: float
+    frequency_per_week: int
+
+@app.post("/routes/open")
+def open_route_from_ui(req: OpenRouteFromUIRequest):
+    engine = create_engine(os.getenv("DATABASE_URL"))
+    with engine.connect() as connection:
+        fleet_row = connection.execute(sql_text("""
+            SELECT f.id, f.status, at.max_range_km, at.name,
+                   a.hub_airport_id
+            FROM fleet f
+            JOIN aircraft_types at ON f.aircraft_type_id = at.id
+            JOIN airlines a ON f.airline_id = a.id
+            WHERE f.id = :fleet_id AND f.airline_id = :airline_id
+        """), {"fleet_id": req.fleet_id, "airline_id": req.airline_id}).fetchone()
+
+        if not fleet_row:
+            return {"error": "Aircraft not found"}
+        if fleet_row.status != "idle":
+            return {"error": f"Aircraft is not idle (status: {fleet_row.status})"}
+
+        origin = connection.execute(sql_text("""
+            SELECT id, latitude, longitude FROM airports WHERE id = :id
+        """), {"id": fleet_row.hub_airport_id}).fetchone()
+
+        destination = connection.execute(sql_text("""
+            SELECT id, latitude, longitude FROM airports WHERE id = :id
+        """), {"id": req.destination_airport_id}).fetchone()
+
+        if not destination:
+            return {"error": "Destination airport not found"}
+
+        distance = haversine_km(origin.latitude, origin.longitude, destination.latitude, destination.longitude)
+
+        if distance > fleet_row.max_range_km:
+            return {"error": f"Distance ({round(distance)}km) exceeds {fleet_row.name}'s range ({fleet_row.max_range_km}km)"}
+
+        result = connection.execute(sql_text("""
+            INSERT INTO routes (airline_id, origin_airport_id, destination_airport_id, fleet_id, price_economy, price_business, price_first, frequency_per_week)
+            VALUES (:airline_id, :origin, :dest, :fleet_id, :pe, :pb, :pf, :freq)
+            RETURNING id
+        """), {
+            "airline_id": req.airline_id, "origin": origin.id, "dest": destination.id,
+            "fleet_id": req.fleet_id, "pe": req.price_economy, "pb": req.price_business,
+            "pf": req.price_first, "freq": req.frequency_per_week
+        })
+        route_id = result.fetchone()[0]
+
+        connection.execute(sql_text("UPDATE fleet SET status = 'assigned' WHERE id = :id"), {"id": req.fleet_id})
+        connection.commit()
+
+        return {"route_id": route_id, "distance_km": round(distance), "status": "Route opened"}
